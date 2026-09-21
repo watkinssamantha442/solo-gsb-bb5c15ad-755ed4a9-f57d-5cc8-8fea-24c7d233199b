@@ -7,9 +7,30 @@
 from __future__ import annotations
 
 import math
-from typing import List, Literal, Optional, Union
+from typing import List, Literal, Optional, Protocol, Sequence, Union
 
 from pydantic import BaseModel, Field, model_validator
+
+
+class _HasEndpoints(Protocol):
+    """鸭子类型：仅要求提供观测端点属性（source/target）。"""
+
+    source: str
+    target: str
+
+
+def collect_nodes(
+    explicit_nodes: Optional[Sequence[str]],
+    reference: str,
+    observations: Sequence[_HasEndpoints],
+) -> List[str]:
+    """合并显式节点、观测端点与参考节点，按字典序返回。"""
+    nodes = set(explicit_nodes or [])
+    nodes.add(reference)
+    for obs in observations:
+        nodes.add(obs.source)
+        nodes.add(obs.target)
+    return sorted(nodes)
 
 
 class ObservationIn(BaseModel):
@@ -66,12 +87,7 @@ class DiagnosisRequest(BaseModel):
 
     def effective_nodes(self) -> List[str]:
         """合并显式节点、观测端点与参考节点。"""
-        nodes = set(self.nodes or [])
-        nodes.add(self.reference)
-        for o in self.observations:
-            nodes.add(o.source)
-            nodes.add(o.target)
-        return sorted(nodes)
+        return collect_nodes(self.nodes, self.reference, self.observations)
 
 
 class NodeBounds(BaseModel):
@@ -150,3 +166,35 @@ class BatchItemResponse(BaseModel):
 class BatchDiagnosisResponse(BaseModel):
     count: int
     results: List[BatchItemResponse]
+
+
+class RepairRequest(DiagnosisRequest):
+    """修复建议请求：在单条诊断请求的基础上增加删除上限。"""
+
+    max_repairs: int = Field(
+        default=3,
+        ge=0,
+        description="最多允许删除的观测条数（默认 3）；搜索开销随其组合式增长",
+    )
+
+
+class RepairResponse(BaseModel):
+    """修复建议响应。
+
+    ``diagnosis`` 为应用建议（删除 ``removed_observation_ids``）后的诊断摘要：
+    原系统本就可行或修复成功时为可行结果；达到上限未找到修复时为原系统的
+    不可行结果（含矛盾环）。
+    """
+
+    name: Optional[str] = None
+    max_repairs: int = Field(..., description="本次生效的删除上限")
+    removed_observation_ids: List[str] = Field(
+        ...,
+        description="建议删除的观测 ID（按字典序）；空列表表示无需删除或上限内无解",
+    )
+    limit_reached: bool = Field(
+        ..., description="是否在 max_repairs 上限内未找到可行修复"
+    )
+    diagnosis: Union[FeasibleDiagnosis, InfeasibleDiagnosis] = Field(
+        ..., discriminator="feasible", description="应用建议后的诊断摘要"
+    )

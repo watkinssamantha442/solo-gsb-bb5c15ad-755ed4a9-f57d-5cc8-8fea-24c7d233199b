@@ -1,6 +1,6 @@
 """差分约束求解器测试。"""
 
-from app.solver import Observation, diagnose
+from app.solver import Observation, diagnose, suggest_repair
 
 
 def _obs(id_, source, target, lo, hi):
@@ -200,3 +200,80 @@ def test_regression_relaxed_edge_endpoint_off_chain():
     assert cycle["accumulated_bound"] == -5.0  # N2->N3 权 0 + N3->N2 权 -5
     for i, step in enumerate(cycle["steps"]):
         assert step["from"] == cycle["steps"][i - 1]["to"]
+
+
+def test_suggest_repair_already_feasible_returns_empty():
+    obs = [_obs("o1", "A", "B", 0, 5)]
+    removed, remaining = suggest_repair(
+        nodes=["A", "B"], reference="A", observations=obs, max_repairs=3
+    )
+    assert removed == []
+    assert remaining == obs
+
+
+def test_suggest_repair_single_deletion_picks_lex_smallest():
+    # o1/o2 互相矛盾，删除任意一条均可行 -> 选字典序最小的 o1
+    obs = [_obs("o1", "A", "B", 0, 10), _obs("o2", "B", "A", 3, 4)]
+    removed, remaining = suggest_repair(
+        nodes=["A", "B"], reference="A", observations=obs, max_repairs=3
+    )
+    assert removed == ["o1"]
+    assert [o.id for o in remaining] == ["o2"]
+
+
+def test_suggest_repair_two_independent_contradictions():
+    # 两对独立矛盾 a1/a2 与 b1/b2：需各删一条 -> 字典序最小组合 [a1, b1]
+    obs = [
+        _obs("a1", "A", "B", 0, 10),
+        _obs("a2", "B", "A", 3, 4),
+        _obs("b1", "C", "D", 0, 10),
+        _obs("b2", "D", "C", 3, 4),
+    ]
+    removed, remaining = suggest_repair(
+        nodes=["A", "B", "C", "D"], reference="A", observations=obs, max_repairs=3
+    )
+    assert removed == ["a1", "b1"]
+    assert [o.id for o in remaining] == ["a2", "b2"]
+
+
+def test_suggest_repair_self_loop_plus_pair():
+    # bad 自环矛盾 + c1/c2 对矛盾：最小修复为删 bad 与 c1/c2 之一
+    obs = [
+        _obs("bad", "A", "A", 1, 2),
+        _obs("c1", "A", "B", 0, 10),
+        _obs("c2", "B", "A", 3, 4),
+    ]
+    removed, remaining = suggest_repair(
+        nodes=["A", "B"], reference="A", observations=obs, max_repairs=3
+    )
+    assert removed == ["bad", "c1"]
+    assert [o.id for o in remaining] == ["c2"]
+
+
+def test_suggest_repair_limit_reached_returns_none():
+    # 两处独立矛盾至少需要删 2 条，上限 1 时无解
+    obs = [
+        _obs("a1", "A", "B", 0, 10),
+        _obs("a2", "B", "A", 3, 4),
+        _obs("b1", "C", "D", 0, 10),
+        _obs("b2", "D", "C", 3, 4),
+    ]
+    removed, remaining = suggest_repair(
+        nodes=["A", "B", "C", "D"], reference="A", observations=obs, max_repairs=1
+    )
+    assert removed is None and remaining is None
+
+
+def test_suggest_repair_zero_budget():
+    obs = [_obs("bad", "A", "A", 1, 2)]
+    removed, remaining = suggest_repair(
+        nodes=["A"], reference="A", observations=obs, max_repairs=0
+    )
+    assert removed is None and remaining is None
+
+
+def test_suggest_repair_does_not_mutate_input():
+    obs = [_obs("o1", "A", "B", 0, 10), _obs("o2", "B", "A", 3, 4)]
+    snapshot = list(obs)
+    suggest_repair(nodes=["A", "B"], reference="A", observations=obs, max_repairs=3)
+    assert obs == snapshot  # 原列表与观测对象均未改变

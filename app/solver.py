@@ -20,12 +20,19 @@
   总和为负，即形如 ``0 <= 负数`` 的矛盾。
 
 所有结果的顺序均按 (观测 ID, 约束类型) / 节点字典序确定，保证稳定输出。
+
+修复建议
+--------
+``suggest_repair`` 在不修改任何观测的前提下，搜索使剩余系统恢复可行的
+最小观测删除集合：按 (删除数量, 观测 ID 字典序) 递增枚举候选，首个可行
+集合即唯一答案，与观测的提交顺序无关。
 """
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -276,3 +283,39 @@ def diagnose(
         "node_bounds": node_bounds,
         "unconstrained_nodes": unconstrained,
     }
+
+
+def suggest_repair(
+    nodes: Sequence[str],
+    reference: str,
+    observations: Sequence[Observation],
+    max_repairs: int,
+) -> Tuple[Optional[List[str]], Optional[List[Observation]]]:
+    """搜索使剩余系统恢复可行的最小观测删除集合（不修改任何观测）。
+
+    按 (删除数量, 观测 ID 字典序) 递增枚举候选集合：
+    ``itertools.combinations`` 在按 ID 排序的输入上即按字典序产出组合，
+    因此第一个使剩余系统可行的集合就是唯一答案。
+
+    返回 ``(removed_ids, remaining)``：
+
+    * 系统本就可行 -> ``([], 按 ID 排序的全部观测)``；
+    * 找到修复 -> ``removed_ids`` 为按字典序排列的待删观测 ID，
+      ``remaining`` 为删除后的剩余观测（原观测对象不变）；
+    * 上限内无解 -> ``(None, None)``。
+
+    说明：搜索是穷举的，开销随 ``max_repairs`` 组合式增长，
+    调用方应把删除上限控制在较小范围。
+    """
+    ordered = sorted(observations, key=lambda o: o.id)
+    if diagnose(nodes, reference, ordered)["feasible"]:
+        return [], list(ordered)
+
+    budget = max(0, min(max_repairs, len(ordered)))
+    for k in range(1, budget + 1):
+        for combo in itertools.combinations(ordered, k):
+            removed = {o.id for o in combo}
+            remaining = [o for o in ordered if o.id not in removed]
+            if diagnose(nodes, reference, remaining)["feasible"]:
+                return [o.id for o in combo], remaining
+    return None, None

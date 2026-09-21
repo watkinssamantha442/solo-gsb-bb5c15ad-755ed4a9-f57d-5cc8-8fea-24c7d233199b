@@ -146,3 +146,148 @@ def test_batch_order_and_index_stable():
 def test_batch_empty_rejected():
     resp = client.post("/api/v1/diagnose/batch", json={"diagnoses": []})
     assert resp.status_code == 422
+
+
+def test_repair_feasible_returns_empty_suggestion():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 1, "max": 5}
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["removed_observation_ids"] == []
+    assert data["limit_reached"] is False
+    assert data["max_repairs"] == 3  # 默认上限
+    assert data["diagnosis"]["feasible"] is True
+
+
+def test_repair_infeasible_minimal_deletion():
+    payload = {
+        "name": "fixme",
+        "reference": "A",
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+            {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4},
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["name"] == "fixme"
+    assert data["removed_observation_ids"] == ["o1"]
+    assert data["limit_reached"] is False
+    diag = data["diagnosis"]
+    assert diag["feasible"] is True
+    assert diag["name"] == "fixme"
+    bounds = {b["node"]: b for b in diag["node_bounds"]}
+    # 剩余 o2：x_A - x_B ∈ [3, 4] -> x_B - x_A ∈ [-4, -3]
+    assert bounds["B"]["lower"] == -4.0 and bounds["B"]["upper"] == -3.0
+
+
+def test_repair_default_max_repairs_allows_two_deletions():
+    # 两对独立矛盾需删 2 条，默认上限 3 足够
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "a1", "source": "A", "target": "B", "min": 0, "max": 10},
+            {"id": "a2", "source": "B", "target": "A", "min": 3, "max": 4},
+            {"id": "b1", "source": "C", "target": "D", "min": 0, "max": 10},
+            {"id": "b2", "source": "D", "target": "C", "min": 3, "max": 4},
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["max_repairs"] == 3
+    assert data["removed_observation_ids"] == ["a1", "b1"]
+    assert data["limit_reached"] is False
+    assert data["diagnosis"]["feasible"] is True
+
+
+def test_repair_limit_reached_returns_original_infeasible_diagnosis():
+    payload = {
+        "reference": "A",
+        "max_repairs": 1,
+        "observations": [
+            {"id": "a1", "source": "A", "target": "B", "min": 0, "max": 10},
+            {"id": "a2", "source": "B", "target": "A", "min": 3, "max": 4},
+            {"id": "b1", "source": "C", "target": "D", "min": 0, "max": 10},
+            {"id": "b2", "source": "D", "target": "C", "min": 3, "max": 4},
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["removed_observation_ids"] == []
+    assert data["limit_reached"] is True
+    diag = data["diagnosis"]
+    assert diag["feasible"] is False
+    assert diag["cycle"]["accumulated_bound"] < 0
+
+
+def test_repair_max_repairs_zero_on_infeasible():
+    payload = {
+        "reference": "A",
+        "max_repairs": 0,
+        "observations": [
+            {"id": "bad", "source": "A", "target": "A", "min": 1, "max": 2}
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["limit_reached"] is True
+    assert data["removed_observation_ids"] == []
+    assert data["diagnosis"]["feasible"] is False
+
+
+def test_repair_negative_max_repairs_rejected():
+    payload = {"reference": "A", "max_repairs": -1, "observations": []}
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 422
+
+
+def test_repair_unknown_field_rejected():
+    payload = {"reference": "A", "observations": [], "bogus": 1}
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 422
+
+
+def test_repair_dropped_observation_node_vanishes():
+    # bad 为 C 上的自环矛盾；删除后 C 不再是剩余系统的一部分
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "ok", "source": "A", "target": "B", "min": 0, "max": 1},
+            {"id": "bad", "source": "C", "target": "C", "min": 1, "max": 2},
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["removed_observation_ids"] == ["bad"]
+    diag = data["diagnosis"]
+    assert diag["feasible"] is True
+    assert [b["node"] for b in diag["node_bounds"]] == ["A", "B"]
+
+
+def test_repair_explicit_nodes_are_retained():
+    # 显式声明的节点在修复后保留，被删观测的节点变为不受约束
+    payload = {
+        "reference": "A",
+        "nodes": ["A", "B", "C"],
+        "observations": [
+            {"id": "ok", "source": "A", "target": "B", "min": 0, "max": 1},
+            {"id": "bad", "source": "C", "target": "C", "min": 1, "max": 2},
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["removed_observation_ids"] == ["bad"]
+    diag = data["diagnosis"]
+    assert [b["node"] for b in diag["node_bounds"]] == ["A", "B", "C"]
+    assert diag["unconstrained_nodes"] == ["C"]

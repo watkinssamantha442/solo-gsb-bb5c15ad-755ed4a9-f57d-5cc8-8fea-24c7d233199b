@@ -8,7 +8,10 @@
    双向约束的节点（孤岛 / 单向可达）；
 3. **不可行时**：返回一条由观测 ID 组成的 **矛盾环**、环上每条约束边及累计界限
    （形如 `0 <= -3.0`），环的起点与顺序经过规范化，多次调用结果稳定；
-4. 提供 **批量诊断接口**，结果按提交下标稳定返回。
+4. **修复建议**：不可行时在不修改任何原观测的前提下，搜索使剩余系统恢复可行的
+   **最小观测删除集合**（按删除数量、观测 ID 字典序唯一确定），返回待删观测 ID、
+   修复后的诊断摘要，以及是否触及删除上限；
+5. 提供 **批量诊断接口**，结果按提交下标稳定返回。
 
 算法：差分约束图 + Bellman-Ford（超源初始化检测负环、前驱指针回卷提取矛盾环），
 纯 Python 标准实现，无外部服务依赖。
@@ -165,6 +168,119 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose \
 - `weight` 为差分约束图中的边权，`accumulated_bound` 为环上权值之和（负数），
   沿环累加推出 `0 <= accumulated_bound`，即矛盾式。
 
+### `POST /api/v1/diagnose/repair` — 修复建议
+
+请求体沿用单条诊断请求的全部字段，并增加一个可选字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `max_repairs` | integer | 否 | 最多允许删除的观测条数，默认 `3`，须 ≥ 0 |
+
+语义：**不修改任何原观测**，仅搜索「删除哪些观测可让剩余系统恢复可行」。
+候选集合按 **删除数量最少** 优先、同数量时按 **观测 ID 字典序** 最小枚举，
+首个可行集合即唯一答案（与观测提交顺序无关）。
+
+响应字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `name` | string/null | 请求名称回显 |
+| `max_repairs` | integer | 本次生效的删除上限 |
+| `removed_observation_ids` | string[] | 建议删除的观测 ID（字典序）；空数组表示无需删除或上限内无解 |
+| `limit_reached` | boolean | `true` 表示在 `max_repairs` 上限内不存在可行修复（此时建议为空） |
+| `diagnosis` | object | 应用建议后的诊断摘要（结构同单条诊断响应） |
+
+三种情形：
+
+- **原系统本就可行**：`removed_observation_ids` 为空、`limit_reached=false`，
+  `diagnosis` 即原系统的可行诊断；
+- **修复成功**：`removed_observation_ids` 给出待删集合，`diagnosis` 为删除后
+  剩余系统的可行诊断。其节点集合按「显式 `nodes` ∪ `reference` ∪ 剩余观测端点」
+  重新计算——仅出现在被删观测中的节点随之消失；显式声明的节点保留，
+  并可能落入 `unconstrained_nodes`；
+- **达到上限**：`removed_observation_ids` 为空、`limit_reached=true`，
+  `diagnosis` 为原系统的不可行诊断（含矛盾环），可调大 `max_repairs` 重试。
+  注意搜索是穷举的，开销随上限组合式增长，请勿设置过大的上限。
+
+#### 修复成功（示例）
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/repair \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+      {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4}
+    ]
+  }'
+```
+
+```json
+{
+  "name": null,
+  "max_repairs": 3,
+  "removed_observation_ids": ["o1"],
+  "limit_reached": false,
+  "diagnosis": {
+    "feasible": true,
+    "reference": "A",
+    "name": null,
+    "node_bounds": [
+      {"node": "A", "lower": 0.0, "upper": 0.0,
+       "reachable_from_reference": true, "can_reach_reference": true, "constrained": true},
+      {"node": "B", "lower": -4.0, "upper": -3.0,
+       "reachable_from_reference": true, "can_reach_reference": true, "constrained": true}
+    ],
+    "unconstrained_nodes": []
+  }
+}
+```
+
+删除 `o1` 后仅剩 `o2`（`x_A - x_B ∈ [3, 4]`），故 `x_B - x_A ∈ [-4, -3]`。
+
+#### 达到上限（示例）
+
+两对独立矛盾至少需要删除 2 条观测，`max_repairs=1` 时：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/repair \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "max_repairs": 1,
+    "observations": [
+      {"id": "a1", "source": "A", "target": "B", "min": 0, "max": 10},
+      {"id": "a2", "source": "B", "target": "A", "min": 3, "max": 4},
+      {"id": "b1", "source": "C", "target": "D", "min": 0, "max": 10},
+      {"id": "b2", "source": "D", "target": "C", "min": 3, "max": 4}
+    ]
+  }'
+```
+
+```json
+{
+  "name": null,
+  "max_repairs": 1,
+  "removed_observation_ids": [],
+  "limit_reached": true,
+  "diagnosis": {
+    "feasible": false,
+    "name": null,
+    "cycle": {
+      "steps": [
+        {"observation_id": "a2", "from": "A", "to": "B",
+         "constraint": "lower", "weight": -3.0, "bound": 3.0},
+        {"observation_id": "a1", "from": "B", "to": "A",
+         "constraint": "lower", "weight": 0.0, "bound": 0.0}
+      ],
+      "accumulated_bound": -3.0,
+      "contradiction": "0 <= -3.0"
+    }
+  }
+}
+```
+
 ### `POST /api/v1/diagnose/batch` — 批量诊断
 
 请求体 `{"diagnoses": [ <单条请求>, ... ]}`（至少 1 条）。每条可带 `name`，
@@ -206,7 +322,9 @@ HTTP `422` 及详细错误信息。
 
 - 参考节点 `r` 到 `v` 的**最短路** = `x_v - x_r` 的最紧上界；
 - 反图中 `r` 到 `v` 的最短路取负 = 最紧下界；
-- **负环 ⇔ 不可行**；负环即矛盾环，环上权值之和恒为负。
+- **负环 ⇔ 不可行**；负环即矛盾环，环上权值之和恒为负；
+- **修复**：穷举删除子集（按删除数量、观测 ID 字典序），首个使剩余图无负环的
+  集合即唯一修复建议；删除全部观测必然可行，因此上限不小于观测总数时必有解。
 
 结果顺序的确定性保证：
 
@@ -219,10 +337,10 @@ HTTP `422` 及详细错误信息。
 
 ```
 app/
-  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/health
+  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/health
   models.py    # 请求/响应 Pydantic 模型与入参校验
-  solver.py    # 差分约束建模、Bellman-Ford、负环提取与规范化
-tests/         # 算法层与 HTTP 接口测试（20 个用例）
+  solver.py    # 差分约束建模、Bellman-Ford、负环提取与规范化、最小删除集合搜索
+tests/         # 算法层与 HTTP 接口测试（38 个用例）
 Dockerfile
 docker-compose.yml
 ```
