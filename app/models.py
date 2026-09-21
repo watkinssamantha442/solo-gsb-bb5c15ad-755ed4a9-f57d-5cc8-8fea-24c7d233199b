@@ -74,6 +74,17 @@ class DiagnosisRequest(BaseModel):
         return sorted(nodes)
 
 
+class RepairRequest(DiagnosisRequest):
+    """修复建议请求：在单条诊断模型上增加删除上限。"""
+
+    max_repairs: int = Field(
+        default=3,
+        ge=0,
+        le=10,
+        description="最多允许删除的观测条数；搜索成本随该值组合式增长",
+    )
+
+
 class NodeBounds(BaseModel):
     node: str
     lower: Optional[float] = Field(
@@ -129,6 +140,34 @@ class InfeasibleDiagnosis(BaseModel):
 
 
 DiagnosisResponse = Union[FeasibleDiagnosis, InfeasibleDiagnosis]
+
+
+class RepairResponse(BaseModel):
+    """修复建议响应。
+
+    三种情形：
+      * 原系统可行：``deleted_observation_ids`` 为空、``repaired_diagnosis``
+        为 ``None``（空建议，无需修复）；
+      * 原系统不可行且在上限内找到最小修复：返回删除 ID 与修复后诊断摘要；
+      * 最小修复所需删除数超过 ``max_repairs``：``limit_reached`` 为
+        ``True``，建议为空。
+    """
+
+    feasible: bool = Field(..., description="原始观测系统是否可行")
+    name: Optional[str] = None
+    max_repairs: int = Field(..., description="本次请求实际使用的删除上限")
+    limit_reached: bool = Field(
+        ...,
+        description="原系统不可行且最小修复所需删除数超过 max_repairs 时为 true",
+    )
+    deleted_observation_ids: List[str] = Field(
+        ...,
+        description="建议删除的观测 ID（按字典序）；系统可行或达到上限时为空",
+    )
+    repaired_diagnosis: Optional[FeasibleDiagnosis] = Field(
+        ...,
+        description="删除建议观测后剩余系统的诊断摘要；无建议时为 null",
+    )
 
 
 class BatchDiagnosisRequest(BaseModel):

@@ -146,3 +146,121 @@ def test_batch_order_and_index_stable():
 def test_batch_empty_rejected():
     resp = client.post("/api/v1/diagnose/batch", json={"diagnoses": []})
     assert resp.status_code == 422
+
+
+def test_repair_feasible_returns_empty_suggestion():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 5}
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["feasible"] is True
+    assert data["max_repairs"] == 3  # 默认值
+    assert data["limit_reached"] is False
+    assert data["deleted_observation_ids"] == []
+    assert data["repaired_diagnosis"] is None
+
+
+def test_repair_single_deletion_with_summary():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+            {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4},
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["feasible"] is False
+    assert data["limit_reached"] is False
+    # 删 o1 或 o2 均可，选字典序最小的 o1
+    assert data["deleted_observation_ids"] == ["o1"]
+    repaired = data["repaired_diagnosis"]
+    assert repaired["feasible"] is True
+    bounds = {b["node"]: b for b in repaired["node_bounds"]}
+    # 删除 o1 后仅剩 o2：x_A - x_B ∈ [3, 4]，即 x_B - x_A ∈ [-4, -3]
+    assert bounds["B"]["lower"] == -4.0 and bounds["B"]["upper"] == -3.0
+    assert repaired["unconstrained_nodes"] == []
+
+
+def test_repair_respects_max_repairs_and_picks_lexicographic():
+    payload = {
+        "reference": "A",
+        "max_repairs": 2,
+        "observations": [
+            {"id": "o3", "source": "A", "target": "B", "min": 10, "max": 11},
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 1},
+            {"id": "o2", "source": "A", "target": "B", "min": 5, "max": 6},
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["feasible"] is False
+    assert data["limit_reached"] is False
+    # 三条区间两两互斥，至少删 2 条，字典序最小对为 [o1, o2]
+    assert data["deleted_observation_ids"] == ["o1", "o2"]
+    bounds = {b["node"]: b for b in data["repaired_diagnosis"]["node_bounds"]}
+    assert bounds["B"]["lower"] == 10.0 and bounds["B"]["upper"] == 11.0
+
+
+def test_repair_limit_reached():
+    payload = {
+        "reference": "A",
+        "max_repairs": 1,
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 1},
+            {"id": "o2", "source": "A", "target": "B", "min": 5, "max": 6},
+            {"id": "o3", "source": "A", "target": "B", "min": 10, "max": 11},
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["feasible"] is False
+    assert data["limit_reached"] is True
+    assert data["deleted_observation_ids"] == []
+    assert data["repaired_diagnosis"] is None
+
+
+def test_repair_keeps_explicit_nodes_and_name():
+    payload = {
+        "reference": "A",
+        "name": "case-7",
+        "nodes": ["A", "B", "Z"],
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 1},
+            {"id": "o2", "source": "A", "target": "B", "min": 5, "max": 6},
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/repair", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["name"] == "case-7"
+    assert data["deleted_observation_ids"] == ["o1"]
+    # 显式声明的节点在修复后保留，孤岛节点仍标记为不受约束
+    nodes = [b["node"] for b in data["repaired_diagnosis"]["node_bounds"]]
+    assert nodes == ["A", "B", "Z"]
+    assert data["repaired_diagnosis"]["unconstrained_nodes"] == ["Z"]
+
+
+def test_repair_invalid_max_repairs_rejected():
+    payload = {"reference": "A", "max_repairs": -1, "observations": []}
+    assert client.post("/api/v1/diagnose/repair", json=payload).status_code == 422
+    payload["max_repairs"] = 11
+    assert client.post("/api/v1/diagnose/repair", json=payload).status_code == 422
+
+
+def test_repair_invalid_interval_rejected():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 9, "max": 1}
+        ],
+    }
+    assert client.post("/api/v1/diagnose/repair", json=payload).status_code == 422

@@ -1,6 +1,6 @@
 """差分约束求解器测试。"""
 
-from app.solver import Observation, diagnose
+from app.solver import Observation, diagnose, find_minimal_repair, is_feasible
 
 
 def _obs(id_, source, target, lo, hi):
@@ -200,3 +200,57 @@ def test_regression_relaxed_edge_endpoint_off_chain():
     assert cycle["accumulated_bound"] == -5.0  # N2->N3 权 0 + N3->N2 权 -5
     for i, step in enumerate(cycle["steps"]):
         assert step["from"] == cycle["steps"][i - 1]["to"]
+
+
+def test_is_feasible():
+    assert is_feasible(["A", "B"], [_obs("o1", "A", "B", 0, 1)]) is True
+    assert is_feasible(["A"], []) is True
+    assert (
+        is_feasible(
+            ["A", "B"],
+            [_obs("o1", "A", "B", 0, 1), _obs("o2", "B", "A", 3, 4)],
+        )
+        is False
+    )
+
+
+def test_repair_already_feasible_returns_empty():
+    result = find_minimal_repair(
+        ["A", "B"], [_obs("o1", "A", "B", 0, 1)], max_repairs=3
+    )
+    assert result == []
+
+
+def test_repair_single_deletion_tie_break_lexicographic():
+    # o1 与 o2 区间互斥，o3 无害；删 o1 或 o2 均可恢复可行，选字典序最小的 o1
+    obs = [
+        _obs("o2", "A", "B", 5, 6),
+        _obs("o3", "B", "C", 0, 1),
+        _obs("o1", "A", "B", 0, 1),
+    ]
+    assert find_minimal_repair(["A", "B", "C"], obs, max_repairs=3) == ["o1"]
+
+
+def test_repair_prefers_fewest_deletions_then_lexicographic():
+    # 三条同端点观测区间两两互斥：至少删 2 条，字典序最小对为 [o1, o2]
+    obs = [
+        _obs("o1", "A", "B", 0, 1),
+        _obs("o2", "A", "B", 5, 6),
+        _obs("o3", "A", "B", 10, 11),
+    ]
+    assert find_minimal_repair(["A", "B"], obs, max_repairs=1) is None
+    assert find_minimal_repair(["A", "B"], obs, max_repairs=2) == ["o1", "o2"]
+
+
+def test_repair_result_independent_of_submission_order():
+    obs = [
+        _obs("o1", "A", "B", 0, 1),
+        _obs("o2", "A", "B", 5, 6),
+        _obs("o3", "A", "B", 10, 11),
+    ]
+    assert find_minimal_repair(["A", "B"], obs[::-1], max_repairs=3) == ["o1", "o2"]
+
+
+def test_repair_zero_budget_on_infeasible_system():
+    obs = [_obs("o1", "A", "B", 0, 1), _obs("o2", "A", "B", 5, 6)]
+    assert find_minimal_repair(["A", "B"], obs, max_repairs=0) is None

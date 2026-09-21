@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 from typing import List, Optional, Sequence
 
 
@@ -276,3 +277,41 @@ def diagnose(
         "node_bounds": node_bounds,
         "unconstrained_nodes": unconstrained,
     }
+
+
+def is_feasible(nodes: Sequence[str], observations: Sequence[Observation]) -> bool:
+    """仅判断可行性（检测负环，不计算节点界）。
+
+    可行性与参考节点无关：负环检测以零虚拟源覆盖全部节点。
+    """
+    edges = _build_edges(observations)
+    return _extract_negative_cycle(edges, sorted(set(nodes))) is None
+
+
+def find_minimal_repair(
+    nodes: Sequence[str],
+    observations: Sequence[Observation],
+    max_repairs: int,
+) -> Optional[List[str]]:
+    """搜索使剩余系统可行的最小观测删除集（只删除，不修改任何观测）。
+
+    按 (删除数量, 观测 ID 字典序) 枚举：删除数量从 1 递增，同数量内
+    ``itertools.combinations`` 在字典序 ID 序列上天然按字典序产出，
+    因此第一个可行的删除集即唯一结果，与观测提交顺序无关。
+
+    返回按字典序排列的待删除观测 ID 列表：
+
+    * 系统本就可行时返回空列表；
+    * 在 ``max_repairs`` 上限内不存在可行删除集时返回 ``None``（达到上限）。
+    """
+    ordered = sorted(observations, key=lambda o: o.id)
+    if is_feasible(nodes, ordered):
+        return []
+    ids = [o.id for o in ordered]
+    for k in range(1, max_repairs + 1):
+        for combo in combinations(ids, k):
+            deleted = set(combo)
+            remaining = [o for o in ordered if o.id not in deleted]
+            if is_feasible(nodes, remaining):
+                return list(combo)
+    return None

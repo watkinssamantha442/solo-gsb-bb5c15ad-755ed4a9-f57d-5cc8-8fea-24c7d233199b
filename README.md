@@ -8,7 +8,9 @@
    双向约束的节点（孤岛 / 单向可达）；
 3. **不可行时**：返回一条由观测 ID 组成的 **矛盾环**、环上每条约束边及累计界限
    （形如 `0 <= -3.0`），环的起点与顺序经过规范化，多次调用结果稳定；
-4. 提供 **批量诊断接口**，结果按提交下标稳定返回。
+4. **修复建议**：不可行时在不修改任何观测的前提下，搜索 **删除观测的最小集合**
+   使剩余系统恢复可行，按（删除数量, 观测 ID 字典序）稳定选出唯一结果；
+5. 提供 **批量诊断接口**，结果按提交下标稳定返回。
 
 算法：差分约束图 + Bellman-Ford（超源初始化检测负环、前驱指针回卷提取矛盾环），
 纯 Python 标准实现，无外部服务依赖。
@@ -28,6 +30,21 @@ docker compose up --build -d
 - 健康检查：<http://localhost:8000/health>
 - 交互式文档（Swagger UI）：<http://localhost:8000/docs>
 - OpenAPI Schema：<http://localhost:8000/openapi.json>
+
+启动后验证（容器状态与一次最小修复请求）：
+
+```bash
+docker compose ps                 # STATUS 列应显示 (healthy)
+curl -s http://localhost:8000/health
+curl -s -X POST http://localhost:8000/api/v1/diagnose/repair \
+  -H 'Content-Type: application/json' \
+  -d '{"reference":"A","observations":[
+        {"id":"o1","source":"A","target":"B","min":0,"max":10},
+        {"id":"o2","source":"B","target":"A","min":3,"max":4}]}'
+# 期望：deleted_observation_ids 为 ["o1"]，repaired_diagnosis.feasible 为 true
+```
+
+排查问题可查看实时日志：`docker compose logs -f`。
 
 停止：
 
@@ -184,6 +201,103 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/batch \
   ]}'
 ```
 
+### `POST /api/v1/diagnose/repair` — 修复建议
+
+请求体沿用单条诊断模型的全部字段（`reference` / `observations` / `nodes` / `name`），
+并增加一个可选字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `max_repairs` | int | 否 | 最多允许删除的观测条数，默认 `3`，取值 `0–10`；搜索成本随其组合式增长 |
+
+语义：
+
+- 原系统 **可行**：无需修复，返回空建议（`deleted_observation_ids` 为空、
+  `repaired_diagnosis` 为 `null`）；
+- 原系统 **不可行**：只删除、不修改任何观测，按删除数量 `1, 2, …` 递增、
+  同数量内按观测 ID 字典序枚举，第一个使剩余系统可行的删除集即唯一结果，
+  与观测提交顺序无关；
+- 最小修复所需删除数超过 `max_repairs` 时，返回 `limit_reached: true` 与空建议。
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `feasible` | 原始观测系统是否可行 |
+| `name` | 请求中的可选名称，原样回显 |
+| `max_repairs` | 本次请求实际使用的删除上限 |
+| `limit_reached` | 不可行且最小修复超过删除上限时为 `true` |
+| `deleted_observation_ids` | 建议删除的观测 ID（按字典序）；无建议时为空 |
+| `repaired_diagnosis` | 删除后剩余系统的诊断摘要（结构与可行诊断一致，节点集与请求保持一致）；无建议时为 `null` |
+
+#### 不可行 → 最小删除集（示例）
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/repair \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+      {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4}
+    ]
+  }'
+```
+
+```json
+{
+  "feasible": false,
+  "name": null,
+  "max_repairs": 3,
+  "limit_reached": false,
+  "deleted_observation_ids": ["o1"],
+  "repaired_diagnosis": {
+    "feasible": true,
+    "reference": "A",
+    "name": null,
+    "node_bounds": [
+      {"node": "A", "lower": 0.0, "upper": 0.0,
+       "reachable_from_reference": true, "can_reach_reference": true, "constrained": true},
+      {"node": "B", "lower": -4.0, "upper": -3.0,
+       "reachable_from_reference": true, "can_reach_reference": true, "constrained": true}
+    ],
+    "unconstrained_nodes": []
+  }
+}
+```
+
+删除 `o1` 或 `o2` 均可恢复可行，按（删除数量, 观测 ID 字典序）稳定选中 `o1`；
+修复后仅剩 `o2`：`x_A - x_B ∈ [3, 4]`，即 `x_B - x_A ∈ [-4, -3]`。
+
+#### 达到删除上限（示例）
+
+三条区间两两互斥的观测至少需要删除 2 条，`max_repairs: 1` 时无法修复：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/repair \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "max_repairs": 1,
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 1},
+      {"id": "o2", "source": "A", "target": "B", "min": 5, "max": 6},
+      {"id": "o3", "source": "A", "target": "B", "min": 10, "max": 11}
+    ]
+  }'
+```
+
+```json
+{
+  "feasible": false,
+  "name": null,
+  "max_repairs": 1,
+  "limit_reached": true,
+  "deleted_observation_ids": [],
+  "repaired_diagnosis": null
+}
+```
+
 ### `GET /health`
 
 返回 `{"status": "ok"}`，compose 已配置健康检查。
@@ -213,16 +327,17 @@ HTTP `422` 及详细错误信息。
 - 节点一律按字典序输出；
 - Bellman-Ford 的边按 `(观测 ID, 约束类型 upper<lower)` 排序后松弛，先到先松弛；
 - 矛盾环先沿前驱回卷，再旋转到 `(起点节点, 观测 ID, 约束类型)` 最小的边作为唯一起点；
-- 因此相同的观测集合无论提交顺序如何，矛盾环与累计界限完全一致。
+- 修复建议在字典序观测 ID 上按（删除数量, ID 字典序）枚举，首个可行删除集即唯一结果；
+- 因此相同的观测集合无论提交顺序如何，矛盾环、累计界限与修复建议完全一致。
 
 ## 项目结构
 
 ```
 app/
-  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/health
+  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/repair、/api/v1/diagnose/batch、/health
   models.py    # 请求/响应 Pydantic 模型与入参校验
-  solver.py    # 差分约束建模、Bellman-Ford、负环提取与规范化
-tests/         # 算法层与 HTTP 接口测试（20 个用例）
+  solver.py    # 差分约束建模、Bellman-Ford、负环提取与规范化、最小删除集搜索
+tests/         # 算法层与 HTTP 接口测试（35 个用例）
 Dockerfile
 docker-compose.yml
 ```
